@@ -548,7 +548,11 @@ impl Config2 {
         true
     }
 
-    /// Apply an unprivileged user's config while retaining root-authoritative trust state.
+    /// Apply an unprivileged user's config while retaining root-authoritative trust,
+    /// unattended-access policy, and self-host routing state.
+    ///
+    /// Managed endpoint rotation must use an explicit privileged migration path;
+    /// user config sync cannot change these adopted values.
     pub fn set_from_unprivileged_sync(mut incoming: Config2) -> bool {
         let current = CONFIG2.read().unwrap();
         Self::preserve_service_trust(&current, &mut incoming);
@@ -558,7 +562,14 @@ impl Config2 {
 
     fn preserve_service_trust(current: &Config2, incoming: &mut Config2) {
         incoming.trusted_devices = current.trusted_devices.clone();
-        for key in [keys::OPTION_APPROVE_MODE, keys::OPTION_VERIFICATION_METHOD] {
+        for key in [
+            keys::OPTION_APPROVE_MODE,
+            keys::OPTION_VERIFICATION_METHOD,
+            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER,
+            keys::OPTION_RELAY_SERVER,
+            keys::OPTION_KEY,
+            keys::OPTION_API_SERVER,
+        ] {
             match current.options.get(key) {
                 Some(value) => {
                     incoming.options.insert(key.to_owned(), value.clone());
@@ -705,12 +716,7 @@ impl Config {
         } else {
             return Err(anyhow!("Bootstrap config has no valid stable identity"));
         }
-        if imported.id.is_empty()
-            || imported.key_pair.0.is_empty()
-            || imported.key_pair.1.is_empty()
-        {
-            return Err(anyhow!("Bootstrap config has no valid stable identity"));
-        }
+        Self::validate_bootstrap_identity(&imported)?;
         imported.credential_generation = 0;
         // Identity bootstrap never imports user-controlled credential storage.
         // The validated service credential is overlaid immediately afterwards.
@@ -719,6 +725,31 @@ impl Config {
         let mut stored_config = imported.clone();
         stored_config.id.clear();
         Ok((imported, imported2, stored_config))
+    }
+
+    fn validate_bootstrap_identity(config: &Config) -> crate::ResultType<()> {
+        const MAX_ID_BYTES: usize = 253;
+        const FORBIDDEN_ID_CHARS: &[char] = &['"', '<', '>', '/', '\\', '|', '?', '*'];
+
+        if config.id.is_empty()
+            || config.id.len() > MAX_ID_BYTES
+            || config.id.chars().any(|character| {
+                character.is_control()
+                    || character.is_whitespace()
+                    || FORBIDDEN_ID_CHARS.contains(&character)
+            })
+        {
+            return Err(anyhow!("Bootstrap config has invalid identity syntax"));
+        }
+
+        let secret_key = sign::SecretKey::from_slice(&config.key_pair.0)
+            .ok_or_else(|| anyhow!("Bootstrap config has invalid secret-key length"))?;
+        let public_key = sign::PublicKey::from_slice(&config.key_pair.1)
+            .ok_or_else(|| anyhow!("Bootstrap config has invalid public-key length"))?;
+        if secret_key.public_key() != public_key {
+            return Err(anyhow!("Bootstrap config keypair does not correspond"));
+        }
+        Ok(())
     }
 
     fn load_<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
@@ -1531,8 +1562,13 @@ impl Config {
     }
 
     fn preserve_service_credential(current: &Config, incoming: &mut Config) {
+        incoming.id = current.id.clone();
+        incoming.enc_id = current.enc_id.clone();
         incoming.password = current.password.clone();
         incoming.salt = current.salt.clone();
+        incoming.key_pair = current.key_pair.clone();
+        incoming.key_confirmed = current.key_confirmed;
+        incoming.keys_confirmed = current.keys_confirmed.clone();
         incoming.credential_generation = current.credential_generation;
     }
 
@@ -4293,8 +4329,7 @@ mod tests {
     fn service_bootstrap_preserves_identity_keypair_and_self_host_server() {
         let (pk, sk) = sign::gen_keypair();
         let mut source = Config::default();
-        source.enc_id =
-            encrypt_str_or_original("123456789", PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        source.enc_id = encrypt_str_or_original("123456789", PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
         source.key_pair = (sk.0.to_vec(), pk.0.to_vec());
         let mut source2 = Config2::default();
         source2.options.insert(
@@ -4329,20 +4364,69 @@ mod tests {
     }
 
     #[test]
+    fn service_bootstrap_rejects_malformed_identity_and_keypairs() {
+        let (pk, sk) = sign::gen_keypair();
+        let mut valid = Config::default();
+        valid.id = "123456789".to_owned();
+        valid.key_pair = (sk.0.to_vec(), pk.0.to_vec());
+        assert!(Config::validate_bootstrap_identity(&valid).is_ok());
+
+        for malformed_id in [
+            "contains whitespace".to_owned(),
+            "contains/slash".to_owned(),
+            "x".repeat(254),
+        ] {
+            let mut malformed = valid.clone();
+            malformed.id = malformed_id;
+            assert!(Config::validate_bootstrap_identity(&malformed).is_err());
+        }
+
+        let mut short_secret = valid.clone();
+        short_secret.key_pair.0.pop();
+        assert!(Config::validate_bootstrap_identity(&short_secret).is_err());
+
+        let mut short_public = valid.clone();
+        short_public.key_pair.1.pop();
+        assert!(Config::validate_bootstrap_identity(&short_public).is_err());
+
+        let (other_pk, _) = sign::gen_keypair();
+        let mut mismatched = valid;
+        mismatched.key_pair.1 = other_pk.0.to_vec();
+        assert!(Config::validate_bootstrap_identity(&mismatched).is_err());
+    }
+
+    #[test]
     fn hostile_user_sync_cannot_replace_service_credential_or_trust() {
         assert!(!Config::is_managed_service_credential(&Config::default()));
         let mut root = Config::default();
+        root.id = "root-id".to_owned();
+        root.enc_id = "root-enc-id".to_owned();
         root.password = "root-storage".to_owned();
         root.salt = "root-salt".to_owned();
+        root.key_pair = (vec![1], vec![2]);
+        root.key_confirmed = true;
+        root.keys_confirmed.insert("root-key".to_owned(), true);
         root.credential_generation = 12;
         assert!(Config::is_managed_service_credential(&root));
         let mut hostile = Config::default();
+        hostile.id = "hostile-id".to_owned();
+        hostile.enc_id = "hostile-enc-id".to_owned();
         hostile.password = "hostile-storage".to_owned();
         hostile.salt = "hostile-salt".to_owned();
+        hostile.key_pair = (vec![3], vec![4]);
+        hostile.key_confirmed = false;
+        hostile
+            .keys_confirmed
+            .insert("hostile-key".to_owned(), true);
         hostile.credential_generation = u64::MAX;
         Config::preserve_service_credential(&root, &mut hostile);
+        assert_eq!(hostile.id, "root-id");
+        assert_eq!(hostile.enc_id, "root-enc-id");
         assert_eq!(hostile.password, "root-storage");
         assert_eq!(hostile.salt, "root-salt");
+        assert_eq!(hostile.key_pair, (vec![1], vec![2]));
+        assert!(hostile.key_confirmed);
+        assert_eq!(hostile.keys_confirmed, root.keys_confirmed);
         assert_eq!(hostile.credential_generation, 12);
 
         let mut root2 = Config2::default();
@@ -4354,6 +4438,14 @@ mod tests {
             keys::OPTION_VERIFICATION_METHOD.to_owned(),
             "use-permanent-password".to_owned(),
         );
+        for (key, value) in [
+            (keys::OPTION_CUSTOM_RENDEZVOUS_SERVER, "root.example.test"),
+            (keys::OPTION_RELAY_SERVER, "relay.example.test"),
+            (keys::OPTION_KEY, "root-public-key"),
+            (keys::OPTION_API_SERVER, "https://api.example.test"),
+        ] {
+            root2.options.insert(key.to_owned(), value.to_owned());
+        }
         let mut hostile2 = Config2::default();
         hostile2.trusted_devices = "hostile-trust".to_owned();
         hostile2
@@ -4363,6 +4455,16 @@ mod tests {
             keys::OPTION_VERIFICATION_METHOD.to_owned(),
             "use-temporary-password".to_owned(),
         );
+        for key in [
+            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER,
+            keys::OPTION_RELAY_SERVER,
+            keys::OPTION_KEY,
+            keys::OPTION_API_SERVER,
+        ] {
+            hostile2
+                .options
+                .insert(key.to_owned(), "hostile-value".to_owned());
+        }
         Config2::preserve_service_trust(&root2, &mut hostile2);
         assert_eq!(hostile2.trusted_devices, "root-trust");
         assert_eq!(
@@ -4379,5 +4481,16 @@ mod tests {
                 .map(String::as_str),
             Some("use-permanent-password")
         );
+        for (key, expected) in [
+            (keys::OPTION_CUSTOM_RENDEZVOUS_SERVER, "root.example.test"),
+            (keys::OPTION_RELAY_SERVER, "relay.example.test"),
+            (keys::OPTION_KEY, "root-public-key"),
+            (keys::OPTION_API_SERVER, "https://api.example.test"),
+        ] {
+            assert_eq!(
+                hostile2.options.get(key).map(String::as_str),
+                Some(expected)
+            );
+        }
     }
 }
