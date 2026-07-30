@@ -220,6 +220,8 @@ pub struct Config {
     password: String,
     #[serde(default, deserialize_with = "deserialize_string")]
     salt: String,
+    #[serde(default)]
+    credential_generation: u64,
     #[serde(default, deserialize_with = "deserialize_keypair")]
     key_pair: KeyPair, // sk, pk
     #[serde(default, deserialize_with = "deserialize_bool")]
@@ -545,6 +547,71 @@ impl Config2 {
         lock.store();
         true
     }
+
+    /// Apply an unprivileged user's config while retaining root-authoritative trust state.
+    pub fn set_from_unprivileged_sync(mut incoming: Config2) -> bool {
+        let current = CONFIG2.read().unwrap();
+        Self::preserve_service_trust(&current, &mut incoming);
+        drop(current);
+        Self::set(incoming)
+    }
+
+    fn preserve_service_trust(current: &Config2, incoming: &mut Config2) {
+        incoming.trusted_devices = current.trusted_devices.clone();
+        for key in [keys::OPTION_APPROVE_MODE, keys::OPTION_VERIFICATION_METHOD] {
+            match current.options.get(key) {
+                Some(value) => {
+                    incoming.options.insert(key.to_owned(), value.clone());
+                }
+                None => {
+                    incoming.options.remove(key);
+                }
+            }
+        }
+    }
+
+    fn enforce_service_access_policy_persisted(clear_trust: bool) -> crate::ResultType<()> {
+        let mut candidate = CONFIG2.read().unwrap().clone();
+        candidate
+            .options
+            .insert(keys::OPTION_APPROVE_MODE.to_owned(), "password".to_owned());
+        candidate.options.insert(
+            keys::OPTION_VERIFICATION_METHOD.to_owned(),
+            "use-permanent-password".to_owned(),
+        );
+        let devices = if clear_trust {
+            let devices = encrypt_str_or_original("[]", PASSWORD_ENC_VERSION, 1024 * 1024);
+            candidate.trusted_devices = devices.clone();
+            Some(devices)
+        } else {
+            None
+        };
+        store_path(Self::file(), &candidate)?;
+        let stored: Config2 = confy::load_path(Self::file())?;
+        if stored
+            .options
+            .get(keys::OPTION_APPROVE_MODE)
+            .map(String::as_str)
+            != Some("password")
+            || stored
+                .options
+                .get(keys::OPTION_VERIFICATION_METHOD)
+                .map(String::as_str)
+                != Some("use-permanent-password")
+            || devices
+                .as_ref()
+                .is_some_and(|devices| stored.trusted_devices != *devices)
+        {
+            return Err(anyhow!(
+                "Service access policy persistence verification failed"
+            ));
+        }
+        *CONFIG2.write().unwrap() = candidate;
+        if clear_trust {
+            *TRUSTED_DEVICES.write().unwrap() = (Default::default(), true);
+        }
+        Ok(())
+    }
 }
 
 fn keep_encrypted_storage_if_plaintext_unchanged(plain: &str, stored: &str) -> String {
@@ -591,6 +658,69 @@ pub fn store_path<T: serde::Serialize>(path: PathBuf, cfg: T) -> crate::ResultTy
 }
 
 impl Config {
+    /// Adopt an existing user's stable host identity into an unmanaged root service.
+    ///
+    /// This is intentionally a one-time operation: once a managed credential
+    /// generation exists, later user files cannot replace root identity or keys.
+    pub fn bootstrap_service_config(
+        config_toml: &[u8],
+        config2_toml: &[u8],
+    ) -> crate::ResultType<bool> {
+        if Self::has_managed_service_credential() {
+            return Ok(false);
+        }
+        let (imported, imported2, stored_config) =
+            Self::prepare_service_bootstrap(config_toml, config2_toml)?;
+
+        store_path(Self::file(), &stored_config)?;
+        store_path(Config2::file(), &imported2)?;
+        let verified: Config = confy::load_path(Self::file())?;
+        let verified2: Config2 = confy::load_path(Config2::file())?;
+        if verified.enc_id != stored_config.enc_id
+            || verified.key_pair != stored_config.key_pair
+            || verified2 != imported2
+        {
+            return Err(anyhow!("Bootstrap config persistence verification failed"));
+        }
+
+        *CONFIG.write().unwrap() = imported;
+        *CONFIG2.write().unwrap() = imported2;
+        Ok(true)
+    }
+
+    fn prepare_service_bootstrap(
+        config_toml: &[u8],
+        config2_toml: &[u8],
+    ) -> crate::ResultType<(Config, Config2, Config)> {
+        let mut imported: Config = toml::from_str(std::str::from_utf8(config_toml)?)?;
+        let imported2: Config2 = toml::from_str(std::str::from_utf8(config2_toml)?)?;
+
+        let (decrypted_id, encrypted, _) =
+            decrypt_str_or_original(&imported.enc_id, PASSWORD_ENC_VERSION);
+        if encrypted {
+            imported.id = decrypted_id;
+        } else if !imported.id.is_empty() && imported.enc_id.is_empty() {
+            imported.enc_id =
+                encrypt_str_or_original(&imported.id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        } else {
+            return Err(anyhow!("Bootstrap config has no valid stable identity"));
+        }
+        if imported.id.is_empty()
+            || imported.key_pair.0.is_empty()
+            || imported.key_pair.1.is_empty()
+        {
+            return Err(anyhow!("Bootstrap config has no valid stable identity"));
+        }
+        imported.credential_generation = 0;
+        // Identity bootstrap never imports user-controlled credential storage.
+        // The validated service credential is overlaid immediately afterwards.
+        imported.password.clear();
+
+        let mut stored_config = imported.clone();
+        stored_config.id.clear();
+        Ok((imported, imported2, stored_config))
+    }
+
     fn load_<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
         suffix: &str,
     ) -> T {
@@ -1320,6 +1450,102 @@ impl Config {
         config.store();
         Self::clear_trusted_devices();
         true
+    }
+
+    /// Provision the root service credential before any service IPC or child starts.
+    ///
+    /// The existing salt is deliberately retained across rotations. A successful
+    /// return means the credential was written and a fresh read of the on-disk file
+    /// matched the intended password storage, salt, and generation.
+    pub fn provision_service_permanent_password(password: &str) -> crate::ResultType<bool> {
+        // This privileged boot-time path is the authority that may enforce a
+        // credential even when interactive password changes are disabled.
+        if password.is_empty() {
+            return Err(anyhow!("Permanent password provisioning was refused"));
+        }
+
+        let current = CONFIG.read().unwrap().clone();
+        let Some(candidate) = Self::prepare_service_credential_rotation(&current, password)? else {
+            Config2::enforce_service_access_policy_persisted(false)?;
+            let stored: Config = confy::load_path(Self::file())?;
+            if stored.password != current.password
+                || stored.salt != current.salt
+                || stored.credential_generation != current.credential_generation
+            {
+                return Err(anyhow!(
+                    "Existing permanent password persistence verification failed"
+                ));
+            }
+            return Ok(false);
+        };
+
+        // Clear trust first. If the password write fails, losing trust is safe; the
+        // inverse order could leave a rotated password with stale trusted devices.
+        Config2::enforce_service_access_policy_persisted(true)?;
+
+        let mut stored_candidate = candidate.clone();
+        Self::prepare_config_for_store(&mut stored_candidate);
+        store_path(Self::file(), &stored_candidate)?;
+        let stored: Config = confy::load_path(Self::file())?;
+        if stored.password != stored_candidate.password
+            || stored.salt != stored_candidate.salt
+            || stored.credential_generation != stored_candidate.credential_generation
+        {
+            return Err(anyhow!(
+                "Permanent password persistence verification failed"
+            ));
+        }
+        *CONFIG.write().unwrap() = candidate;
+        Ok(true)
+    }
+
+    fn prepare_service_credential_rotation(
+        current: &Config,
+        password: &str,
+    ) -> crate::ResultType<Option<Config>> {
+        let mut candidate = current.clone();
+        Self::ensure_permanent_password_salt(&mut candidate);
+        let h1 = compute_permanent_password_h1(password, &candidate.salt);
+        if decode_permanent_password_h1_from_storage(&candidate.password) == Some(h1)
+            && candidate.credential_generation > 0
+        {
+            return Ok(None);
+        }
+        if decode_permanent_password_h1_from_storage(&candidate.password) != Some(h1) {
+            candidate.password = encode_permanent_password_encrypted_storage_from_h1(&h1)
+                .ok_or_else(|| anyhow!("Failed to prepare permanent password storage"))?;
+        }
+        candidate.credential_generation = candidate
+            .credential_generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Credential generation overflow"))?;
+        Ok(Some(candidate))
+    }
+
+    /// Apply an unprivileged user's config while retaining service-owned credential state.
+    pub fn set_from_unprivileged_sync(mut incoming: Config) -> bool {
+        let current = CONFIG.read().unwrap();
+        Self::preserve_service_credential(&current, &mut incoming);
+        drop(current);
+        Self::set(incoming)
+    }
+
+    fn preserve_service_credential(current: &Config, incoming: &mut Config) {
+        incoming.password = current.password.clone();
+        incoming.salt = current.salt.clone();
+        incoming.credential_generation = current.credential_generation;
+    }
+
+    pub fn credential_generation() -> u64 {
+        CONFIG.read().unwrap().credential_generation
+    }
+
+    pub fn has_managed_service_credential() -> bool {
+        Self::is_managed_service_credential(&CONFIG.read().unwrap())
+    }
+
+    fn is_managed_service_credential(config: &Config) -> bool {
+        config.credential_generation > 0
     }
 
     fn compute_permanent_password_storage_for_update(
@@ -4023,5 +4249,135 @@ mod tests {
         let non_service_root = Config::ipc_path_for_uid(ROOT_UID, "");
         let non_service_user = Config::ipc_path_for_uid(USER_UID, "");
         assert_ne!(non_service_root, non_service_user);
+    }
+
+    #[test]
+    fn service_credential_rotation_is_stable_and_idempotent() {
+        let mut current = Config::default();
+        current.salt = "host-stable-salt".to_owned();
+        current.credential_generation = 7;
+
+        let rotated = Config::prepare_service_credential_rotation(&current, "first")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rotated.salt, "host-stable-salt");
+        assert_eq!(rotated.credential_generation, 8);
+        assert_eq!(
+            decode_permanent_password_h1_from_storage(&rotated.password),
+            Some(compute_permanent_password_h1("first", "host-stable-salt"))
+        );
+        assert!(!toml::to_string(&rotated).unwrap().contains("first"));
+        assert!(
+            Config::prepare_service_credential_rotation(&rotated, "first")
+                .unwrap()
+                .is_none()
+        );
+
+        let mut unmanaged_same = rotated.clone();
+        unmanaged_same.credential_generation = 0;
+        let adopted = Config::prepare_service_credential_rotation(&unmanaged_same, "first")
+            .unwrap()
+            .unwrap();
+        assert_eq!(adopted.password, unmanaged_same.password);
+        assert_eq!(adopted.salt, unmanaged_same.salt);
+        assert_eq!(adopted.credential_generation, 1);
+
+        let rotated_again = Config::prepare_service_credential_rotation(&rotated, "second")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rotated_again.salt, "host-stable-salt");
+        assert_eq!(rotated_again.credential_generation, 9);
+    }
+
+    #[test]
+    fn service_bootstrap_preserves_identity_keypair_and_self_host_server() {
+        let (pk, sk) = sign::gen_keypair();
+        let mut source = Config::default();
+        source.enc_id =
+            encrypt_str_or_original("123456789", PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        source.key_pair = (sk.0.to_vec(), pk.0.to_vec());
+        let mut source2 = Config2::default();
+        source2.options.insert(
+            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_owned(),
+            "desk.example.test".to_owned(),
+        );
+
+        let config_toml = toml::to_string(&source).unwrap();
+        let config2_toml = toml::to_string(&source2).unwrap();
+        let (live, live2, stored) =
+            Config::prepare_service_bootstrap(config_toml.as_bytes(), config2_toml.as_bytes())
+                .unwrap();
+        assert_eq!(live.id, "123456789");
+        assert_eq!(live.key_pair, source.key_pair);
+        assert!(stored.id.is_empty());
+        assert!(!stored.enc_id.is_empty());
+        assert_eq!(
+            live2
+                .options
+                .get(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER)
+                .map(String::as_str),
+            Some("desk.example.test")
+        );
+        assert_eq!(live.credential_generation, 0);
+    }
+
+    #[test]
+    fn service_bootstrap_rejects_missing_identity_or_keypair() {
+        let invalid = toml::to_string(&Config::default()).unwrap();
+        let config2 = toml::to_string(&Config2::default()).unwrap();
+        assert!(Config::prepare_service_bootstrap(invalid.as_bytes(), config2.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn hostile_user_sync_cannot_replace_service_credential_or_trust() {
+        assert!(!Config::is_managed_service_credential(&Config::default()));
+        let mut root = Config::default();
+        root.password = "root-storage".to_owned();
+        root.salt = "root-salt".to_owned();
+        root.credential_generation = 12;
+        assert!(Config::is_managed_service_credential(&root));
+        let mut hostile = Config::default();
+        hostile.password = "hostile-storage".to_owned();
+        hostile.salt = "hostile-salt".to_owned();
+        hostile.credential_generation = u64::MAX;
+        Config::preserve_service_credential(&root, &mut hostile);
+        assert_eq!(hostile.password, "root-storage");
+        assert_eq!(hostile.salt, "root-salt");
+        assert_eq!(hostile.credential_generation, 12);
+
+        let mut root2 = Config2::default();
+        root2.trusted_devices = "root-trust".to_owned();
+        root2
+            .options
+            .insert(keys::OPTION_APPROVE_MODE.to_owned(), "password".to_owned());
+        root2.options.insert(
+            keys::OPTION_VERIFICATION_METHOD.to_owned(),
+            "use-permanent-password".to_owned(),
+        );
+        let mut hostile2 = Config2::default();
+        hostile2.trusted_devices = "hostile-trust".to_owned();
+        hostile2
+            .options
+            .insert(keys::OPTION_APPROVE_MODE.to_owned(), "click".to_owned());
+        hostile2.options.insert(
+            keys::OPTION_VERIFICATION_METHOD.to_owned(),
+            "use-temporary-password".to_owned(),
+        );
+        Config2::preserve_service_trust(&root2, &mut hostile2);
+        assert_eq!(hostile2.trusted_devices, "root-trust");
+        assert_eq!(
+            hostile2
+                .options
+                .get(keys::OPTION_APPROVE_MODE)
+                .map(String::as_str),
+            Some("password")
+        );
+        assert_eq!(
+            hostile2
+                .options
+                .get(keys::OPTION_VERIFICATION_METHOD)
+                .map(String::as_str),
+            Some("use-permanent-password")
+        );
     }
 }
