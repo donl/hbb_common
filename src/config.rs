@@ -4442,7 +4442,7 @@ mod tests {
             (keys::OPTION_CUSTOM_RENDEZVOUS_SERVER, "root.example.test"),
             (keys::OPTION_RELAY_SERVER, "relay.example.test"),
             (keys::OPTION_KEY, "root-public-key"),
-            (keys::OPTION_API_SERVER, "https://api.example.test"),
+            (keys::OPTION_API_SERVER, "disabled"),
         ] {
             root2.options.insert(key.to_owned(), value.to_owned());
         }
@@ -4465,7 +4465,13 @@ mod tests {
                 .options
                 .insert(key.to_owned(), "hostile-value".to_owned());
         }
+        hostile2.options.insert(
+            keys::OPTION_API_SERVER.to_owned(),
+            "https://hostile-api.example.test".to_owned(),
+        );
         Config2::preserve_service_trust(&root2, &mut hostile2);
+        let persisted2 = toml::to_string(&hostile2).unwrap();
+        let persisted2: Config2 = toml::from_str(&persisted2).unwrap();
         assert_eq!(hostile2.trusted_devices, "root-trust");
         assert_eq!(
             hostile2
@@ -4485,10 +4491,10 @@ mod tests {
             (keys::OPTION_CUSTOM_RENDEZVOUS_SERVER, "root.example.test"),
             (keys::OPTION_RELAY_SERVER, "relay.example.test"),
             (keys::OPTION_KEY, "root-public-key"),
-            (keys::OPTION_API_SERVER, "https://api.example.test"),
+            (keys::OPTION_API_SERVER, "disabled"),
         ] {
             assert_eq!(
-                hostile2.options.get(key).map(String::as_str),
+                persisted2.options.get(key).map(String::as_str),
                 Some(expected)
             );
         }
