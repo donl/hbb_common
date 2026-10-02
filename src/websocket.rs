@@ -298,6 +298,12 @@ impl WsFramedStream {
                     return Some(Ok(bytes));
                 }
                 WsMessage::Text(text) => {
+                    if self.is_secured() {
+                        return Some(Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "WebSocket text frame received after encryption was enabled",
+                        )));
+                    }
                     let bytes = BytesMut::from(text.as_bytes());
                     return Some(Ok(bytes));
                 }
@@ -404,6 +410,71 @@ pub fn check_ws(endpoint: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::{keys, Config};
+
+    // Backport of rustdesk/hbb_common 1f47a8ec921a998567d7340258d4ff209fafcb4b.
+    // Real loopback frames exercise the encryption boundary and preserve raw-mode behavior.
+    async fn receive_test_frame(
+        frame: WsMessage,
+        secured: bool,
+    ) -> Option<Result<BytesMut, Error>> {
+        sodiumoxide::init().expect("failed to initialize sodiumoxide");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut stream = WebSocketStream::from_raw_socket(tcp, Role::Server, None).await;
+            stream.send(frame).await.unwrap();
+        });
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut client = WsFramedStream::from_tcp_stream(tcp, addr).await.unwrap();
+        if secured {
+            client.set_key(Key([0x42; sodiumoxide::crypto::secretbox::KEYBYTES]));
+        }
+        let result = timeout(Duration::from_secs(5), client.next())
+            .await
+            .expect("loopback receive timed out");
+        timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        result
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_secured_stream_rejects_plaintext_text() {
+        let result = receive_test_frame(WsMessage::Text("plaintext".into()), true).await;
+        assert!(
+            matches!(result, Some(Err(ref err)) if err.kind() == ErrorKind::InvalidData),
+            "secured stream accepted plaintext Text frame: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_raw_stream_accepts_plaintext_text() {
+        let result = receive_test_frame(WsMessage::Text("plaintext".into()), false).await;
+        assert_eq!(result.unwrap().unwrap().as_ref(), b"plaintext");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_secured_stream_accepts_encrypted_binary() {
+        sodiumoxide::init().unwrap();
+        let mut encrypt = Encrypt::new(Key([0x42; sodiumoxide::crypto::secretbox::KEYBYTES]));
+        let frame = WsMessage::Binary(encrypt.enc(b"encrypted payload").into());
+        let result = receive_test_frame(frame, true).await;
+        assert_eq!(result.unwrap().unwrap().as_ref(), b"encrypted payload");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_secured_stream_rejects_plaintext_binary() {
+        let frame = WsMessage::Binary(Bytes::from_static(b"plaintext"));
+        let result = receive_test_frame(frame, true).await;
+        assert!(
+            matches!(result, Some(Err(_))),
+            "secured stream accepted plaintext Binary frame: {:?}",
+            result
+        );
+    }
 
     #[test]
     fn test_check_ws() {
